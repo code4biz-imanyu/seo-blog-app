@@ -6,8 +6,9 @@ import time
 import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
+import httpx
 
-# API設定をロード
+# API設定をロード - Streamlit Cloudとローカル環境の両方に対応
 try:
     # Streamlit Cloud環境の場合
     ANTHROPIC_API_KEY = st.secrets["anthropic"]["api_key"]
@@ -16,8 +17,22 @@ except:
     load_dotenv()
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-# Claude APIクライアントを初期化 - 標準方法で
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# HTTP クライアントのカスタム設定 (プロキシに関連するエラーを回避)
+http_client = httpx.Client(
+    timeout=httpx.Timeout(60.0)  # タイムアウト設定
+)
+
+# Claude APIクライアントを初期化 - カスタム HTTP クライアントを使用
+try:
+    client = anthropic.Anthropic(
+        api_key=ANTHROPIC_API_KEY,
+        http_client=http_client
+    )
+except TypeError:
+    # 'proxies' エラーが発生した場合の代替初期化方法
+    client = anthropic.Anthropic(
+        api_key=ANTHROPIC_API_KEY
+    )
 
 # アプリケーションのタイトルとスタイル
 st.set_page_config(
