@@ -7,57 +7,71 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 import httpx
+import logging
+import sys
 
-# デバッグ用のログ設定
-DEBUG = True
-
-def log_debug(message):
-    if DEBUG:
-        st.sidebar.write(f"DEBUG: {message}")
+# ロギングの設定
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # API設定をロード - Streamlit Cloudとローカル環境の両方に対応
 try:
     # Streamlit Cloud環境の場合
     ANTHROPIC_API_KEY = st.secrets["anthropic"]["api_key"]
-    log_debug("APIキーをStremalitシークレットから読み込みました")
+    logger.info("Streamlit Cloud環境でAPIキーを取得しました")
 except Exception as e:
     # ローカル環境の場合
     load_dotenv()
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-    log_debug(f"APIキーを.envから読み込みました: {ANTHROPIC_API_KEY[:4]}...")
+    logger.info("ローカル環境でAPIキーを取得しました")
+    logger.error(f"APIキー取得エラー（発生した場合）: {str(e)}")
+
+# APIキー情報のログ（セキュリティのため先頭5文字のみ）
+if ANTHROPIC_API_KEY:
+    api_key_preview = ANTHROPIC_API_KEY[:5] + "..." if len(ANTHROPIC_API_KEY) > 5 else "未設定"
+    logger.info(f"APIキー: {api_key_preview}")
+else:
+    logger.error("APIキーが設定されていません")
+    st.error("APIキーが設定されていません。.envファイルまたはStreamlit Secretsで設定してください。")
 
 # HTTP クライアントのカスタム設定 (プロキシに関連するエラーを回避)
-http_client = httpx.Client(
-    timeout=httpx.Timeout(60.0)  # タイムアウト設定
-)
+try:
+    logger.info("HTTPクライアントを初期化しています...")
+    http_client = httpx.Client(
+        timeout=httpx.Timeout(60.0)  # タイムアウト設定
+    )
+    logger.info("HTTPクライアント初期化完了")
+except Exception as e:
+    logger.error(f"HTTPクライアント初期化エラー: {str(e)}")
+    http_client = None
 
 # Claude APIクライアントを初期化 - カスタム HTTP クライアントを使用
 try:
-    client = anthropic.Anthropic(
-        api_key=ANTHROPIC_API_KEY,
-        http_client=http_client
-    )
-    log_debug("Anthropicクライアントを初期化しました (http_client使用)")
-except TypeError:
-    # 'proxies' エラーが発生した場合の代替初期化方法
-    try:
+    logger.info("Anthropic APIクライアントを初期化中...")
+    if http_client:
+        client = anthropic.Anthropic(
+            api_key=ANTHROPIC_API_KEY,
+            http_client=http_client
+        )
+    else:
         client = anthropic.Anthropic(
             api_key=ANTHROPIC_API_KEY
         )
-        log_debug("Anthropicクライアントを初期化しました (標準方法)")
-    except Exception as e:
-        log_debug(f"Anthropicクライアント初期化エラー: {str(e)}")
-        st.error(f"APIクライアントの初期化に失敗しました: {str(e)}")
+    logger.info("Anthropic APIクライアント初期化完了")
+except Exception as e:
+    logger.error(f"Anthropic APIクライアント初期化エラー: {str(e)}")
+    client = None
+    st.error(f"APIクライアントの初期化中にエラーが発生しました: {str(e)}")
 
-# 利用可能なClaudeモデルを指定（古いバージョンのSDKに対応）
-CLAUDE_MODEL = "claude-2.1"  # 古いモデルを使用
-
-# APIのバージョンチェック
-try:
-    anthropic_version = anthropic.__version__
-    log_debug(f"Anthropic SDK バージョン: {anthropic_version}")
-except:
-    log_debug("Anthropic SDKバージョンを取得できません")
+# Anthropicライブラリのバージョン確認
+if 'anthropic' in sys.modules:
+    logger.info(f"Anthropicライブラリバージョン: {anthropic.__version__}")
 
 # アプリケーションのタイトルとスタイル
 st.set_page_config(
@@ -99,8 +113,16 @@ if 'section_contents' not in st.session_state:
     st.session_state.section_contents = {}
 if 'progress' not in st.session_state:
     st.session_state.progress = 0
-if 'api_error' not in st.session_state:
-    st.session_state.api_error = None
+if 'debug_info' not in st.session_state:
+    st.session_state.debug_info = []
+
+# デバッグ情報を追加する関数
+def add_debug_info(info):
+    st.session_state.debug_info.append(f"{datetime.now().strftime('%H:%M:%S')} - {info}")
+    # 最大100件までログを保持
+    if len(st.session_state.debug_info) > 100:
+        st.session_state.debug_info = st.session_state.debug_info[-100:]
+    logger.info(info)
 
 # ナビゲーション関数
 def next_step():
@@ -115,105 +137,82 @@ def go_to_step(step):
     st.session_state.step = step
     st.rerun()
 
-# API呼び出し関数 - 古いバージョンのAnthropicライブラリに対応
-def api_call(prompt, system_prompt="", max_tokens=1000, temperature=0.7):
-    try:
-        # AnthropicのSDKバージョンチェック
-        if hasattr(anthropic, "__version__") and anthropic.__version__.startswith("0.7"):
-            # 0.7.xバージョン用の呼び出し方法
-            log_debug("0.7.x形式でAPIを呼び出します")
-            response = client.completions.create(
-                prompt=f"{anthropic.HUMAN_PROMPT} {system_prompt}\n\n{prompt}{anthropic.AI_PROMPT}",
-                model=CLAUDE_MODEL,
-                max_tokens_to_sample=max_tokens,
-                temperature=temperature,
-            )
-            return response.completion.strip()
-        else:
-            # 0.8.x以降のバージョン用の呼び出し方法
-            log_debug("0.8.x以降の形式でAPIを呼び出します")
-            response = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            return response.content[0].text
-    except Exception as e:
-        log_debug(f"API呼び出しエラー: {str(e)}")
-        st.session_state.api_error = f"API呼び出しエラー: {str(e)}"
-        return None
-
 # 非同期タイトル生成を処理する関数
 def process_title_generation():
     # タイトル生成中フラグを設定
     st.session_state.generating_titles = True
-    st.session_state.api_error = None
     
     # キーワードを取得
     keyword = st.session_state.keyword
+    add_debug_info(f"タイトル生成開始: キーワード '{keyword}'")
     
     # タイトルと関連キーワードを生成
     titles = generate_titles(keyword)
+    add_debug_info(f"タイトル生成結果: {len(titles)}件")
     
-    if titles and len(titles) > 0:
-        related_keywords = suggest_related_keywords(keyword)
-        
-        # 結果をセッション状態に保存
+    if not titles or len(titles) == 0:
+        add_debug_info("タイトル生成に失敗しました。空のリストが返されました。")
+        st.session_state.titles = []
+    else:
         st.session_state.titles = titles
+        add_debug_info(f"生成されたタイトル: {titles}")
+    
+    # 関連キーワード生成
+    try:
+        related_keywords = suggest_related_keywords(keyword)
         st.session_state.related_keywords = related_keywords
-        st.session_state.generating_titles = False
-        
-        # 次のステップに進む
+        add_debug_info(f"関連キーワード生成結果: {len(related_keywords)}件")
+    except Exception as e:
+        add_debug_info(f"関連キーワード生成エラー: {str(e)}")
+        st.session_state.related_keywords = []
+    
+    # 生成完了フラグを設定
+    st.session_state.generating_titles = False
+    
+    # 次のステップに進む
+    if titles and len(titles) > 0:
         st.session_state.step = 2
         st.rerun()
     else:
-        st.session_state.generating_titles = False
-        st.error("タイトル生成に失敗しました。APIエラーを確認してください。")
-        st.rerun()
+        add_debug_info("タイトルが生成されなかったため、次のステップに進みません")
 
 # 記事構造の生成を処理する関数
 def process_structure_generation():
     # 構造生成中フラグを設定
     st.session_state.generating_structure = True
-    st.session_state.api_error = None
     
     # タイトルとキーワードを取得
     selected_title = st.session_state.selected_title
     keyword = st.session_state.keyword
+    add_debug_info(f"記事構造生成開始: タイトル '{selected_title}', キーワード '{keyword}'")
     
     # 記事構造を生成
     structure = generate_article_structure(selected_title, keyword)
     
-    if structure:
-        # 結果をセッション状態に保存
-        st.session_state.article_structure = structure
-        st.session_state.total_sections = len(structure["sections"])
-        st.session_state.current_section = 0
-        st.session_state.section_contents = {}
-        st.session_state.generating_structure = False
-        
-        # 記事生成ステップに進む
-        st.session_state.step = 3
-        st.rerun()
-    else:
-        st.session_state.generating_structure = False
-        st.error("記事構造の生成に失敗しました。APIエラーを確認してください。")
-        st.rerun()
+    # 結果をセッション状態に保存
+    st.session_state.article_structure = structure
+    st.session_state.total_sections = len(structure["sections"])
+    st.session_state.current_section = 0
+    st.session_state.section_contents = {}
+    st.session_state.generating_structure = False
+    
+    add_debug_info(f"記事構造生成完了: {st.session_state.total_sections}セクション")
+    
+    # 記事生成ステップに進む
+    st.session_state.step = 3
+    st.rerun()
 
 # 記事本文の生成を処理する関数
 def process_article_generation():
     # 記事生成中フラグを設定
     st.session_state.generating_article = True
-    st.session_state.api_error = None
     
     # 各セクションの内容を生成
     title = st.session_state.selected_title
     keyword = st.session_state.keyword
     structure = st.session_state.article_structure
+    
+    add_debug_info(f"記事生成開始: タイトル '{title}', キーワード '{keyword}'")
     
     # 進捗バーの初期化
     progress_bar = st.progress(0)
@@ -224,61 +223,51 @@ def process_article_generation():
     
     # 導入部を生成
     progress_text.text("導入部を生成中...")
+    add_debug_info("導入部の生成を開始")
     introduction = generate_article_part(title, keyword, structure, "introduction")
-    if introduction:
-        full_article += introduction + "\n\n"
-        st.session_state.section_contents["introduction"] = introduction
-        progress_bar.progress(0.1)
-    else:
-        st.session_state.generating_article = False
-        st.error("導入部の生成に失敗しました。APIエラーを確認してください。")
-        return
+    full_article += introduction + "\n\n"
+    st.session_state.section_contents["introduction"] = introduction
+    progress_bar.progress(0.1)
+    add_debug_info("導入部の生成完了")
     
     # 各セクションを生成
     total_sections = len(structure["sections"])
     for i, section in enumerate(structure["sections"]):
         section_name = f"section_{i+1}"
-        progress_text.text(f"セクション {i+1}/{total_sections} を生成中: {section['heading']}...")
+        heading = section.get('heading', f'セクション{i+1}')
+        progress_text.text(f"セクション {i+1}/{total_sections} を生成中: {heading}...")
+        add_debug_info(f"セクション {i+1}/{total_sections} '{heading}' の生成を開始")
         
         # セクションの内容を生成
         section_content = generate_article_part(title, keyword, structure, section_name, section_index=i)
-        if section_content:
-            full_article += section_content + "\n\n"
-            st.session_state.section_contents[section_name] = section_content
-        else:
-            st.session_state.generating_article = False
-            st.error(f"セクション {i+1} の生成に失敗しました。APIエラーを確認してください。")
-            return
+        full_article += section_content + "\n\n"
+        st.session_state.section_contents[section_name] = section_content
         
         # 進捗を更新
         progress = 0.1 + (0.8 * (i + 1) / total_sections)
         progress_bar.progress(progress)
         st.session_state.progress = progress
         st.session_state.current_section = i + 1
+        add_debug_info(f"セクション {i+1}/{total_sections} の生成完了")
     
     # 結論部を生成
     progress_text.text("結論部を生成中...")
+    add_debug_info("結論部の生成を開始")
     conclusion = generate_article_part(title, keyword, structure, "conclusion")
-    if conclusion:
-        full_article += conclusion
-        st.session_state.section_contents["conclusion"] = conclusion
-        progress_bar.progress(1.0)
-        progress_text.text("記事生成が完了しました！")
-    else:
-        st.session_state.generating_article = False
-        st.error("結論部の生成に失敗しました。APIエラーを確認してください。")
-        return
+    full_article += conclusion
+    st.session_state.section_contents["conclusion"] = conclusion
+    progress_bar.progress(1.0)
+    progress_text.text("記事生成が完了しました！")
+    add_debug_info("結論部の生成完了")
     
     # 結果をセッション状態に保存
     st.session_state.article = full_article
     st.session_state.edited_article = full_article
     
     # SEO分析を実行
-    try:
-        st.session_state.seo_score = analyze_seo(full_article, keyword)
-    except:
-        # SEO分析に失敗しても続行
-        st.session_state.seo_score = {"keyword_density": 0, "title_optimization": 0, "headings": 0, "internal_links": 0, "content_quality": 0, "readability": 0, "overall_score": 0}
+    add_debug_info("SEO分析を開始")
+    st.session_state.seo_score = analyze_seo(full_article, keyword)
+    add_debug_info("SEO分析完了")
     
     # 生成完了フラグを設定
     st.session_state.generating_article = False
@@ -290,40 +279,78 @@ def process_article_generation():
 # タイトル生成関数
 def generate_titles(keyword):
     try:
-        system_prompt = "あなたはSEOの専門家です。与えられたキーワードに基づいて、SEO最適化された魅力的なブログタイトルを5つ提案してください。タイトルのリストのみを提供してください。"
-        user_prompt = f"以下のキーワードに基づいて、SEO最適化された魅力的なブログタイトルを5つ提案してください。タイトルのみをリストで返してください。キーワード：{keyword}"
+        add_debug_info(f"API呼び出し開始: タイトル生成 (キーワード: {keyword})")
         
-        result = api_call(user_prompt, system_prompt, max_tokens=1000, temperature=0.7)
-        
-        if result:
-            # タイトルのリストを作成
-            titles_list = [line.strip() for line in result.split('\n') if line.strip()]
-            
-            # デモモード（APIキーがない場合）
-            if not titles_list or len(titles_list) == 0:
-                log_debug("デモモード: サンプルタイトルを返します")
-                titles_list = [
-                    f"{keyword}の完全ガイド: 初心者から上級者まで",
-                    f"{keyword}で成功する7つの秘訣",
-                    f"プロが教える{keyword}の基本テクニック",
-                    f"{keyword}の最新トレンド2025年版",
-                    f"今すぐ始める{keyword}マスタープラン"
-                ]
-            
-            return titles_list
-        else:
-            # APIエラーの場合
+        # APIクライアントが初期化されているか確認
+        if client is None:
+            add_debug_info("エラー: APIクライアントが初期化されていません")
             return []
+        
+        # モデル名の確認
+        model_name = "claude-3-7-sonnet-20250219"
+        add_debug_info(f"使用モデル: {model_name}")
+        
+        # システムプロンプトのロギング
+        system_prompt = "あなたはSEOの専門家です。与えられたキーワードに基づいて、SEO最適化された魅力的なブログタイトルを5つ提案してください。タイトルのリストのみを提供してください。"
+        add_debug_info(f"システムプロンプト: {system_prompt}")
+        
+        # ユーザープロンプトのロギング
+        user_prompt = f"以下のキーワードに基づいて、SEO最適化された魅力的なブログタイトルを5つ提案してください。タイトルのみをリストで返してください。キーワード：{keyword}"
+        add_debug_info(f"ユーザープロンプト: {user_prompt}")
+        
+        # APIリクエスト開始
+        start_time = time.time()
+        response = client.messages.create(
+            model=model_name,
+            max_tokens=1000,
+            temperature=0.7,
+            system=system_prompt,
+            messages=[
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        end_time = time.time()
+        
+        # レスポンス時間のロギング
+        add_debug_info(f"API応答時間: {end_time - start_time:.2f}秒")
+        
+        # レスポンスの内容をログに記録（デバッグ用）
+        response_content = response.content[0].text if response and hasattr(response, 'content') and len(response.content) > 0 else "レスポンスが空です"
+        add_debug_info(f"APIレスポンス: {response_content[:200]}...")  # 最初の200文字だけログに記録
+        
+        # レスポンスをチェック
+        if not response or not hasattr(response, 'content') or len(response.content) == 0:
+            add_debug_info("エラー: APIレスポンスが空です")
+            return []
+        
+        # 特殊タグのチェック
+        titles_text = response.content[0].text
+        if "<search_reminders>" in titles_text or "<automated_reminder_from_anthropic>" in titles_text:
+            add_debug_info("警告: APIレスポンスに特殊タグが含まれています")
+            # 特殊タグを削除
+            titles_text = titles_text.replace("<search_reminders>", "")
+            titles_text = titles_text.replace("</search_reminders>", "")
+            titles_text = titles_text.replace("<automated_reminder_from_anthropic>", "")
+            titles_text = titles_text.replace("</automated_reminder_from_anthropic>", "")
+        
+        # タイトルのリストを作成
+        titles_list = [line.strip() for line in titles_text.split('\n') if line.strip()]
+        add_debug_info(f"抽出されたタイトル数: {len(titles_list)}")
+        
+        return titles_list
     except Exception as e:
-        log_debug(f"タイトル生成中にエラーが発生しました: {str(e)}")
-        st.session_state.api_error = f"タイトル生成中にエラーが発生しました: {str(e)}"
+        add_debug_info(f"タイトル生成中にエラーが発生しました: {str(e)}")
+        # エラーのスタックトレースをログに記録
+        import traceback
+        add_debug_info(f"エラースタックトレース: {traceback.format_exc()}")
         return []
 
 # 記事構造生成関数
 def generate_article_structure(title, keyword):
     try:
-        system_prompt = "あなたはSEOとブログ記事構成の専門家です。タイトルとキーワードに基づいて最適な記事構成をJSON形式で提案してください。結果はJSON形式のみで返してください。"
-        user_prompt = f"""
+        add_debug_info(f"API呼び出し開始: 記事構造生成 (タイトル: {title}, キーワード: {keyword})")
+        
+        prompt = f"""
         タイトル：{title}
         キーワード：{keyword}
         
@@ -356,53 +383,79 @@ def generate_article_structure(title, keyword):
         JSONデータのみを返してください。説明文は不要です。
         """
         
-        result = api_call(user_prompt, system_prompt, max_tokens=2000, temperature=0.7)
+        start_time = time.time()
+        response = client.messages.create(
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=2000,
+            temperature=0.7,
+            system="あなたはSEOとブログ記事構成の専門家です。タイトルとキーワードに基づいて最適な記事構成をJSON形式で提案してください。結果はJSON形式のみで返してください。",
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        end_time = time.time()
+        add_debug_info(f"API応答時間: {end_time - start_time:.2f}秒")
         
-        if result:
-            # JSONを抽出（余分なテキストがある場合）
-            if "{" in result and "}" in result:
-                json_start = result.find("{")
-                json_end = result.rfind("}") + 1
-                result = result[json_start:json_end]
-            
-            # JSONをパース
-            try:
-                structure = json.loads(result)
-                return structure
-            except json.JSONDecodeError as e:
-                log_debug(f"JSON解析エラー: {str(e)}")
-                log_debug(f"JSON文字列: {result}")
-                st.session_state.api_error = f"記事構造のJSON解析に失敗しました: {str(e)}"
-                return None
+        # レスポンスの内容をログに記録（デバッグ用）
+        response_content = response.content[0].text if response and hasattr(response, 'content') and len(response.content) > 0 else "レスポンスが空です"
+        add_debug_info(f"APIレスポンス: {response_content[:200]}...")  # 最初の200文字だけログに記録
         
-        # APIエラーの場合
-        return None
+        # レスポンスをチェック
+        if not response or not hasattr(response, 'content') or len(response.content) == 0:
+            add_debug_info("エラー: APIレスポンスが空です")
+            return {
+                "meta": {"title": title, "keyword": keyword, "target_audience": "一般読者", "word_count": 1500},
+                "introduction": "導入部",
+                "sections": [{"heading": "セクション1", "subheadings": [], "keywords": [keyword], "content_brief": "内容の説明"}],
+                "conclusion": "結論部"
+            }
+        
+        # 特殊タグをチェック
+        structure_text = response.content[0].text
+        if "<search_reminders>" in structure_text or "<automated_reminder_from_anthropic>" in structure_text:
+            add_debug_info("警告: APIレスポンスに特殊タグが含まれています")
+            # 特殊タグを削除
+            structure_text = structure_text.replace("<search_reminders>", "")
+            structure_text = structure_text.replace("</search_reminders>", "")
+            structure_text = structure_text.replace("<automated_reminder_from_anthropic>", "")
+            structure_text = structure_text.replace("</automated_reminder_from_anthropic>", "")
+        
+        # JSONを抽出（余分なテキストがある場合）
+        if "{" in structure_text and "}" in structure_text:
+            json_start = structure_text.find("{")
+            json_end = structure_text.rfind("}") + 1
+            structure_text = structure_text[json_start:json_end]
+        
+        add_debug_info(f"解析するJSON: {structure_text[:200]}...")
+        
+        # JSONをパース
+        structure = json.loads(structure_text)
+        add_debug_info(f"記事構造の解析成功: {len(structure.get('sections', []))}セクション")
+        
+        return structure
     except Exception as e:
-        log_debug(f"記事構造生成中にエラーが発生しました: {str(e)}")
-        st.session_state.api_error = f"記事構造生成中にエラーが発生しました: {str(e)}"
-        
-        # デモモード: サンプル構造を返す
+        add_debug_info(f"記事構造生成中にエラーが発生しました: {str(e)}")
+        # エラーのスタックトレースをログに記録
+        import traceback
+        add_debug_info(f"エラースタックトレース: {traceback.format_exc()}")
         return {
             "meta": {"title": title, "keyword": keyword, "target_audience": "一般読者", "word_count": 1500},
             "introduction": "導入部",
-            "sections": [
-                {"heading": "セクション1", "subheadings": [], "keywords": [keyword], "content_brief": "内容の説明"},
-                {"heading": "セクション2", "subheadings": [], "keywords": [keyword], "content_brief": "内容の説明"},
-                {"heading": "セクション3", "subheadings": [], "keywords": [keyword], "content_brief": "内容の説明"}
-            ],
+            "sections": [{"heading": "セクション1", "subheadings": [], "keywords": [keyword], "content_brief": "内容の説明"}],
             "conclusion": "結論部"
         }
 
 # 記事パート生成関数
 def generate_article_part(title, keyword, structure, part_type, section_index=None):
     try:
+        add_debug_info(f"API呼び出し開始: 記事パート生成 (パートタイプ: {part_type}, セクションインデックス: {section_index})")
+        
         # 記事全体の構造をJSON文字列に変換
         structure_json = json.dumps(structure, ensure_ascii=False, indent=2)
         
         # パート別のプロンプトを作成
         if part_type == "introduction":
-            system_prompt = "あなたはSEOと内容に優れたブログ記事の執筆者です。与えられた情報に基づいて、高品質なブログ記事の導入部を作成してください。マークダウン形式で返してください。"
-            user_prompt = f"""
+            prompt = f"""
             タイトル：{title}
             キーワード：{keyword}
             
@@ -419,8 +472,7 @@ def generate_article_part(title, keyword, structure, part_type, section_index=No
             マークダウン形式で導入部分のみを作成してください。見出しは含めないでください。
             """
         elif part_type == "conclusion":
-            system_prompt = "あなたはSEOと内容に優れたブログ記事の執筆者です。与えられた情報に基づいて、高品質なブログ記事の結論部を作成してください。マークダウン形式で返してください。"
-            user_prompt = f"""
+            prompt = f"""
             タイトル：{title}
             キーワード：{keyword}
             
@@ -443,8 +495,7 @@ def generate_article_part(title, keyword, structure, part_type, section_index=No
             section_keywords = section.get("keywords", [keyword])
             content_brief = section.get("content_brief", "")
             
-            system_prompt = "あなたはSEOと内容に優れたブログ記事の執筆者です。与えられた情報に基づいて、高品質なブログ記事のセクションを作成してください。マークダウン形式で返してください。"
-            user_prompt = f"""
+            prompt = f"""
             タイトル：{title}
             メインキーワード：{keyword}
             セクション見出し：{heading}
@@ -465,35 +516,72 @@ def generate_article_part(title, keyword, structure, part_type, section_index=No
             マークダウン形式でこのセクションのみを作成してください。他のセクションは含めないでください。
             """
         
-        # パートを生成
-        result = api_call(user_prompt, system_prompt, max_tokens=2000, temperature=0.7)
+        add_debug_info(f"生成プロンプト: {prompt[:200]}...")  # プロンプトの最初の部分だけログに記録
         
-        return result
+        # パートを生成 - max_tokensを大きく設定
+        start_time = time.time()
+        response = client.messages.create(
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=4000,
+            temperature=0.7,
+            system="あなたはSEOと内容に優れたブログ記事の執筆者です。与えられた情報に基づいて、高品質なブログ記事のパートを作成してください。マークダウン形式で返してください。",
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        end_time = time.time()
+        add_debug_info(f"API応答時間: {end_time - start_time:.2f}秒")
+        
+        # レスポンスの内容をログに記録（デバッグ用）
+        response_content = response.content[0].text if response and hasattr(response, 'content') and len(response.content) > 0 else "レスポンスが空です"
+        add_debug_info(f"APIレスポンス: {response_content[:200]}...")  # 最初の200文字だけログに記録
+        
+        # レスポンスをチェック
+        if not response or not hasattr(response, 'content') or len(response.content) == 0:
+            add_debug_info("エラー: APIレスポンスが空です")
+            if part_type == "introduction":
+                return "## はじめに\n\nこのブログ記事では、重要なトピックについて解説します。"
+            elif part_type == "conclusion":
+                return "## まとめ\n\nこの記事の要点をまとめました。"
+            else:
+                return f"## セクション {section_index + 1}\n\nこのセクションでは重要な情報を提供します。"
+        
+        # 特殊タグをチェック
+        content_text = response.content[0].text
+        if "<search_reminders>" in content_text or "<automated_reminder_from_anthropic>" in content_text:
+            add_debug_info("警告: APIレスポンスに特殊タグが含まれています")
+            # 特殊タグを削除
+            content_text = content_text.replace("<search_reminders>", "")
+            content_text = content_text.replace("</search_reminders>", "")
+            content_text = content_text.replace("<automated_reminder_from_anthropic>", "")
+            content_text = content_text.replace("</automated_reminder_from_anthropic>", "")
+            return content_text
+        
+        return response.content[0].text
     except Exception as e:
-        log_debug(f"記事パート生成中にエラーが発生しました: {str(e)}")
-        st.session_state.api_error = f"記事パート生成中にエラーが発生しました: {str(e)}"
-        
-        # デモモード: サンプル内容を返す
+        add_debug_info(f"記事パート生成中にエラーが発生しました: {str(e)}")
+        # エラーのスタックトレースをログに記録
+        import traceback
+        add_debug_info(f"エラースタックトレース: {traceback.format_exc()}")
         if part_type == "introduction":
-            return f"このブログ記事では、{keyword}について詳しく解説します。{keyword}は現代社会において重要なトピックであり、多くの人が関心を持っています。この記事を読むことで、あなたも{keyword}について詳しく理解できるようになるでしょう。"
+            return "## はじめに\n\nこのブログ記事では、重要なトピックについて解説します。"
         elif part_type == "conclusion":
-            return f"## まとめ\n\nこの記事では、{keyword}についての重要なポイントを解説しました。{keyword}は今後も注目され続けるトピックです。ぜひこの記事で学んだ内容を実践してみてください。"
+            return "## まとめ\n\nこの記事の要点をまとめました。"
         else:
-            section = structure["sections"][section_index]
-            heading = section["heading"]
-            return f"## {heading}\n\nこのセクションでは{keyword}に関する重要な情報を提供します。{keyword}について理解を深めることで、より効果的に活用することができるでしょう。"
+            return f"## セクション {section_index + 1}\n\nこのセクションでは重要な情報を提供します。"
 
 # SEO分析関数
 def analyze_seo(article, keyword):
     try:
-        system_prompt = "あなたはSEO分析の専門家です。提供された記事とキーワードに基づいて、客観的なSEO分析を行ってください。"
-        user_prompt = f"""
+        add_debug_info(f"API呼び出し開始: SEO分析 (キーワード: {keyword}, 記事長: {len(article)} 文字)")
+        
+        prompt = f"""
         以下の記事とキーワードに基づいて、SEO分析を行ってください。
         
         キーワード：{keyword}
         
         記事：
-        {article[:1500]}...
+        {article[:3000]}...
         
         以下の項目について分析し、それぞれ0-100のスコアを付けてください：
         1. キーワード密度
@@ -508,55 +596,99 @@ def analyze_seo(article, keyword):
         {{"keyword_density": 85, "title_optimization": 90, "headings": 80, "internal_links": 70, "content_quality": 85, "readability": 90, "overall_score": 83}}
         """
         
-        result = api_call(user_prompt, system_prompt, max_tokens=1000, temperature=0.2)
+        start_time = time.time()
+        response = client.messages.create(
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=1000,
+            temperature=0.2,
+            system="あなたはSEO分析の専門家です。提供された記事とキーワードに基づいて、客観的なSEO分析を行ってください。",
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        end_time = time.time()
+        add_debug_info(f"API応答時間: {end_time - start_time:.2f}秒")
         
-        if result:
-            # JSONデータを抽出
-            if "{" in result and "}" in result:
-                json_str = result[result.find("{"):result.rfind("}")+1]
-                try:
-                    return json.loads(json_str)
-                except:
-                    log_debug(f"SEO分析のJSON解析に失敗しました: {result}")
+        # レスポンスの内容をログに記録（デバッグ用）
+        response_content = response.content[0].text if response and hasattr(response, 'content') and len(response.content) > 0 else "レスポンスが空です"
+        add_debug_info(f"APIレスポンス: {response_content[:200]}...")  # 最初の200文字だけログに記録
         
-        # エラーまたはJSONなしの場合、デフォルト値を返す
-        return {"keyword_density": 70, "title_optimization": 75, "headings": 80, "internal_links": 60, "content_quality": 85, "readability": 80, "overall_score": 75}
+        # レスポンスをチェック
+        if not response or not hasattr(response, 'content') or len(response.content) == 0:
+            add_debug_info("エラー: APIレスポンスが空です")
+            return {"keyword_density": 0, "title_optimization": 0, "headings": 0, "internal_links": 0, "content_quality": 0, "readability": 0, "overall_score": 0}
+        
+        # 特殊タグをチェック
+        json_str = response.content[0].text.strip()
+        if "<search_reminders>" in json_str or "<automated_reminder_from_anthropic>" in json_str:
+            add_debug_info("警告: APIレスポンスに特殊タグが含まれています")
+            # 特殊タグを削除
+            json_str = json_str.replace("<search_reminders>", "")
+            json_str = json_str.replace("</search_reminders>", "")
+            json_str = json_str.replace("<automated_reminder_from_anthropic>", "")
+            json_str = json_str.replace("</automated_reminder_from_anthropic>", "")
+        
+        # JSON部分を抽出（余分なテキストがある場合）
+        if "{" in json_str and "}" in json_str:
+            json_str = json_str[json_str.find("{"):json_str.rfind("}")+1]
+        
+        add_debug_info(f"解析するJSON: {json_str}")
+        
+        return json.loads(json_str)
     except Exception as e:
-        log_debug(f"SEO分析中にエラーが発生しました: {str(e)}")
+        add_debug_info(f"SEO分析中にエラーが発生しました: {str(e)}")
+        # エラーのスタックトレースをログに記録
+        import traceback
+        add_debug_info(f"エラースタックトレース: {traceback.format_exc()}")
         return {"keyword_density": 0, "title_optimization": 0, "headings": 0, "internal_links": 0, "content_quality": 0, "readability": 0, "overall_score": 0}
 
 # 関連キーワード生成関数
 def suggest_related_keywords(keyword):
     try:
-        system_prompt = "あなたはSEOとキーワードリサーチの専門家です。主要キーワードに関連する効果的なキーワードを提案してください。"
-        user_prompt = f"以下の主要キーワードに関連する10個のキーワードを提案してください。シンプルなリスト形式で返してください。主要キーワード：{keyword}"
+        add_debug_info(f"API呼び出し開始: 関連キーワード生成 (キーワード: {keyword})")
         
-        result = api_call(user_prompt, system_prompt, max_tokens=1000, temperature=0.7)
+        start_time = time.time()
+        response = client.messages.create(
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=1000,
+            temperature=0.7,
+            system="あなたはSEOとキーワードリサーチの専門家です。主要キーワードに関連する効果的なキーワードを提案してください。",
+            messages=[
+                {"role": "user", "content": f"以下の主要キーワードに関連する10個のキーワードを提案してください。シンプルなリスト形式で返してください。主要キーワード：{keyword}"}
+            ]
+        )
+        end_time = time.time()
+        add_debug_info(f"API応答時間: {end_time - start_time:.2f}秒")
         
-        if result:
-            # キーワードのリストを作成
-            keywords_list = [line.strip() for line in result.split('\n') if line.strip()]
-            
-            # デモモード（APIキーがない場合）
-            if not keywords_list or len(keywords_list) == 0:
-                keywords_list = [
-                    f"{keyword} 入門",
-                    f"{keyword} 方法",
-                    f"{keyword} ツール",
-                    f"{keyword} 例",
-                    f"{keyword} おすすめ",
-                    f"{keyword} 初心者",
-                    f"{keyword} 効果",
-                    f"{keyword} 比較",
-                    f"{keyword} 無料",
-                    f"{keyword} コツ"
-                ]
-            
-            return keywords_list
-        else:
+        # レスポンスの内容をログに記録（デバッグ用）
+        response_content = response.content[0].text if response and hasattr(response, 'content') and len(response.content) > 0 else "レスポンスが空です"
+        add_debug_info(f"APIレスポンス: {response_content[:200]}...")  # 最初の200文字だけログに記録
+        
+        # レスポンスをチェック
+        if not response or not hasattr(response, 'content') or len(response.content) == 0:
+            add_debug_info("エラー: APIレスポンスが空です")
             return []
+        
+        # 特殊タグをチェック
+        keywords_text = response.content[0].text
+        if "<search_reminders>" in keywords_text or "<automated_reminder_from_anthropic>" in keywords_text:
+            add_debug_info("警告: APIレスポンスに特殊タグが含まれています")
+            # 特殊タグを削除
+            keywords_text = keywords_text.replace("<search_reminders>", "")
+            keywords_text = keywords_text.replace("</search_reminders>", "")
+            keywords_text = keywords_text.replace("<automated_reminder_from_anthropic>", "")
+            keywords_text = keywords_text.replace("</automated_reminder_from_anthropic>", "")
+        
+        # キーワードのリストを作成
+        keywords_list = [line.strip() for line in keywords_text.split('\n') if line.strip()]
+        add_debug_info(f"抽出された関連キーワード数: {len(keywords_list)}")
+        
+        return keywords_list
     except Exception as e:
-        log_debug(f"関連キーワード生成中にエラーが発生しました: {str(e)}")
+        add_debug_info(f"関連キーワード生成中にエラーが発生しました: {str(e)}")
+        # エラーのスタックトレースをログに記録
+        import traceback
+        add_debug_info(f"エラースタックトレース: {traceback.format_exc()}")
         return []
 
 # 記事を保存する関数
@@ -567,18 +699,14 @@ def save_article(title, article):
     try:
         with open(filename, "w", encoding="utf-8") as f:
             f.write(article)
+        add_debug_info(f"記事を保存しました: {filename}")
         return filename
     except Exception as e:
-        log_debug(f"記事の保存中にエラーが発生しました: {str(e)}")
-        st.error(f"記事の保存中にエラーが発生しました: {str(e)}")
+        add_debug_info(f"記事の保存中にエラーが発生しました: {str(e)}")
         return None
 
 # メイン画面表示
 st.title("✍️ SEO ブログ記事生成ツール")
-
-# APIエラーがあれば表示
-if st.session_state.api_error:
-    st.error(f"API エラーが発生しました: {st.session_state.api_error}")
 
 # ステップ1: キーワード入力
 if st.session_state.step == 1:
@@ -756,3 +884,14 @@ elif st.session_state.step == 4:
     # プレビュー表示
     with st.expander("記事プレビュー", expanded=True):
         st.markdown(edited_article)
+
+# デバッグ情報表示
+with st.expander("デバッグ情報", expanded=False):
+    st.write("### ログ情報")
+    for log in st.session_state.debug_info:
+        st.write(log)
+    
+    st.write("### 環境情報")
+    st.write(f"Streamlitバージョン: {st.__version__}")
+    st.write(f"Anthropicライブラリバージョン: {anthropic.__version__ if 'anthropic' in sys.modules else '不明'}")
+    st.write(f"セッション状態: {list(st.session_state.keys())}")
