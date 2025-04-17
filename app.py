@@ -8,8 +8,13 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # API設定をロード
-load_dotenv()
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+try:
+    # Streamlit Cloud環境の場合
+    ANTHROPIC_API_KEY = st.secrets["anthropic"]["api_key"]
+except:
+    # ローカル環境の場合
+    load_dotenv()
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Claude APIクライアントを初期化 - 標準方法で
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
